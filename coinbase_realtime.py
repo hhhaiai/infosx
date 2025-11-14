@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Coinbase Pro 实时虚拟币价格获取
-依赖: pip install websocket-client
-运行: python coinbase_realtime.py
+Coinbase Pro 实时虚拟币价格获取 - 优化稳定版
+依赖: pip install websocket-client requests
+运行: python coinbase_realtime.py [数量]
 
 Coinbase Pro WebSocket API 公共频道说明:
 - 连接地址: wss://ws-feed.exchange.coinbase.com
@@ -15,6 +15,10 @@ Coinbase Pro WebSocket API 公共频道说明:
 import json
 import time
 import threading
+import requests
+import logging
+import sys
+import argparse
 from websocket import WebSocketApp
 from datetime import datetime
 
@@ -26,19 +30,23 @@ COLOR_BLUE = '\033[94m'
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
 
 class CoinbaseRealtime:
-    """Coinbase Pro WebSocket 实时价格监控"""
+    """Coinbase Pro WebSocket 实时价格监控 - 优化稳定版"""
 
     def __init__(self, top_n=20):
         """
         初始化Coinbase WebSocket客户端
-
-        Coinbase Pro WebSocket API:
-        - 连接地址: wss://ws-feed.exchange.coinbase.com
-        - 订阅格式: {"type": "subscribe", "product_ids": ["BTC-USD"], "channels": ["ticker"]}
-        - 数据格式: 包含价格、24h交易量、买卖盘等
-        - 取消订阅: {"type": "unsubscribe", "product_ids": ["BTC-USD"], "channels": ["ticker"]}
 
         Args:
             top_n (int): 获取市值前N名的币种（默认20）
@@ -46,68 +54,154 @@ class CoinbaseRealtime:
         # Coinbase Pro公共频道WebSocket地址
         self.ws_url = "wss://ws-feed.exchange.coinbase.com"
         self.top_n = top_n
-        self.symbols = self._fetch_top_symbols()
+        self.symbols = self._fetch_top_symbols_with_fallback()
 
         # 存储价格数据
-        self.last_prices = {}
         self.price_data = {}
         self.reconnect_count = 0
         self.max_reconnect = 5
+        self.ws_connected = False
+        self.last_display_time = 0
+        self.first_display = True
 
-    def _fetch_top_symbols(self):
+    def _fetch_top_symbols_with_fallback(self):
         """
-        从CoinGecko获取市值前N名的币种
+        动态获取市值前N名币种，带多层回退机制
+        """
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                logger.info(f"🔄 第 {attempt + 1}/{max_retries} 次尝试获取市值前{self.top_n}名币种...")
+                symbols = self._fetch_valid_coinbase_symbols()
+                if symbols and len(symbols) >= min(10, self.top_n):
+                    logger.info(f"✅ 成功获取 {len(symbols)} 个有效交易对")
+                    return symbols
+                else:
+                    logger.warning(f"⚠️ 第 {attempt + 1} 次获取失败，有效交易对数量不足")
+                    if attempt < max_retries - 1:
+                        time.sleep(2)
+            except Exception as e:
+                logger.error(f"❌ 获取币种列表出错: {e}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+        
+        # 如果所有重试都失败，使用硬编码的备用列表
+        logger.warning("⚠️ 使用备用币种列表")
+        return self._get_fallback_symbols()
 
-        Returns:
-            list: 币种交易对列表（大写，连字符，USD基准）
+    def _fetch_valid_coinbase_symbols(self):
+        """
+        获取有效的Coinbase交易对，确保交易对在Coinbase上真实存在
         """
         try:
-            from price import fetch_top
-            print(f"📊 正在获取市值前{self.top_n}名币种...")
-            top_data = fetch_top(self.top_n)
-            symbols = []
-
-            # 过滤出在Coinbase上可用的交易对（使用USD）
-            coinbase_symbols = []
-            # Coinbase支持的完整币种列表（扩展版）
-            supported = [
-                # 主流币种
-                "BTC", "ETH", "BNB", "XRP", "ADA", "DOGE", "SOL", "DOT",
-                "MATIC", "AVAX", "LINK", "LTC", "TRX", "ETC", "XLM", "BCH",
-                "FIL", "EOS", "XTZ", "AAVE", "MKR", "UNI", "COMP", "YFI",
-                "SUSHI", "CRV", "SNX", "1INCH", "ENJ", "CHZ", "BAT", "ZRX",
-                "OMG", "LRC", "GRT", "ALGO", "ATOM", "VET", "ICP", "FTM",
-                "NEAR", "FLOW", "THETA", "EGLD", "HBAR", "XDC", "QNT", "AXS",
-                "SHIB", "APE", "GMT", "GST", "RUNE", "KSM", "OCEAN",
-                "BAL", "REN", "KNC", "ZIL", "ONT", "DGB", "WAVES", "DASH",
-                "XMR", "ZEC", "NEO", "IOTA", "QTUM", "LSK", "DCR", "RVN",
-                "MANA", "SAND", "GALA", "CRO", "HNT", "MINA", "SUI"
-            ]
-
-            for coin in top_data:
+            # 首先获取Coinbase所有可用的USD交易对
+            coinbase_symbols = self._fetch_coinbase_products()
+            if not coinbase_symbols:
+                return None
+            
+            # 获取市值排名
+            top_coins = self._fetch_market_cap_ranking(self.top_n * 2)
+            if not top_coins:
+                return list(coinbase_symbols)[:self.top_n]
+            
+            # 匹配：找到市值排名中在Coinbase可用的交易对
+            valid_symbols = []
+            
+            for coin in top_coins:
                 symbol = coin['symbol'].upper()
-                full_symbol = f"{symbol}-USD"
-
-                # 检查是否为支持币种
-                if symbol in supported:
-                    coinbase_symbols.append(full_symbol)
-                    if len(coinbase_symbols) >= self.top_n:
+                possible_symbol = f"{symbol}-USD"
+                
+                if possible_symbol in coinbase_symbols:
+                    valid_symbols.append(possible_symbol)
+                    if len(valid_symbols) >= self.top_n:
                         break
-
-            print(f"✅ 成功获取 {len(coinbase_symbols)} 个币种")
-            return coinbase_symbols[:self.top_n]
-
+            
+            logger.info(f"📊 匹配到 {len(valid_symbols)} 个有效交易对")
+            return valid_symbols[:self.top_n]
+            
         except Exception as e:
-            print(f"⚠️  获取市值排名失败，使用默认列表: {e}")
-            # 返回Coinbase支持的默认币种（扩展到20个）
-            supported = [
-                "BTC-USD", "ETH-USD", "BNB-USD", "XRP-USD", "ADA-USD",
-                "DOGE-USD", "SOL-USD", "DOT-USD", "MATIC-USD", "AVAX-USD",
-                "LINK-USD", "LTC-USD", "TRX-USD", "ETC-USD", "XLM-USD",
-                "BCH-USD", "FIL-USD", "EOS-USD", "XTZ-USD", "AAVE-USD",
-                "MKR-USD", "UNI-USD", "YFI-USD", "SNX-USD", "1INCH-USD"
-            ]
-            return supported[:self.top_n]
+            logger.error(f"❌ 获取有效交易对失败: {e}")
+            return None
+
+    def _fetch_coinbase_products(self):
+        """从Coinbase API获取所有可用的交易对"""
+        try:
+            logger.info("📊 获取Coinbase交易对信息...")
+            url = "https://api.exchange.coinbase.com/products"
+            
+            response = requests.get(url, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # 提取所有USD交易对
+            usd_symbols = set()
+            for product in data:
+                if (product['quote_currency'] == 'USD' and 
+                    product['status'] == 'online' and
+                    product['trading_disabled'] is False and
+                    product['cancel_only'] is False and
+                    product['limit_only'] is False and
+                    product['post_only'] is False):
+                    usd_symbols.add(product['id'])
+            
+            logger.info(f"✅ Coinbase返回 {len(usd_symbols)} 个可用USD交易对")
+            return usd_symbols
+            
+        except Exception as e:
+            logger.error(f"❌ 获取Coinbase交易对失败: {e}")
+            return None
+
+    def _fetch_market_cap_ranking(self, limit=40):
+        """获取市值排名"""
+        try:
+            logger.info("📈 获取市值排名...")
+            url = "https://api.coingecko.com/api/v3/coins/markets"
+            params = {
+                'vs_currency': 'usd',
+                'order': 'market_cap_desc',
+                'per_page': limit,
+                'page': 1,
+                'sparkline': 'false'
+            }
+            
+            response = requests.get(url, params=params, timeout=10)
+            response.raise_for_status()
+            
+            data = response.json()
+            
+            # 过滤掉稳定币和无效币种
+            filtered_coins = []
+            stablecoins = ['usdt', 'usdc', 'busd', 'dai', 'ust', 'tusd', 'usdp']
+            
+            for coin in data:
+                symbol_lower = coin['symbol'].lower()
+                if (symbol_lower not in stablecoins and 
+                    len(symbol_lower) <= 8 and
+                    symbol_lower.isalpha()):
+                    filtered_coins.append({
+                        'id': coin['id'],
+                        'symbol': coin['symbol'],
+                        'name': coin['name'],
+                        'market_cap_rank': coin['market_cap_rank']
+                    })
+            
+            logger.info(f"✅ 获取到 {len(filtered_coins)} 个有效币种排名")
+            return filtered_coins
+            
+        except Exception as e:
+            logger.error(f"❌ 获取市值排名失败: {e}")
+            return None
+
+    def _get_fallback_symbols(self):
+        """获取备用币种列表（确保在Coinbase上存在）"""
+        fallback_symbols = [
+            "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD",
+            "ADA-USD", "DOGE-USD", "MATIC-USD", "DOT-USD", "TRX-USD",
+            "AVAX-USD", "LINK-USD", "LTC-USD", "BCH-USD", "ATOM-USD",
+            "ETC-USD", "XLM-USD", "FIL-USD", "EOS-USD", "XTZ-USD"
+        ]
+        return fallback_symbols[:self.top_n]
 
     def on_message(self, ws, message):
         """处理WebSocket消息"""
@@ -118,14 +212,14 @@ class CoinbaseRealtime:
             if 'type' in data:
                 # 订阅确认
                 if data['type'] == 'subscriptions':
-                    print(f"✅ 订阅成功:")
+                    logger.info(f"✅ 订阅成功:")
                     for channel in data['channels']:
-                        print(f"  - {channel['name']}: {', '.join(channel['product_ids'])}")
+                        logger.info(f"  - {channel['name']}: {', '.join(channel['product_ids'])}")
                     return
 
                 # 取消订阅确认
                 if data['type'] == 'unsubscribe':
-                    print(f"✅ 取消订阅成功: {data['product_id']}")
+                    logger.info(f"✅ 取消订阅成功: {data['product_id']}")
                     return
 
                 # ticker数据推送
@@ -137,31 +231,10 @@ class CoinbaseRealtime:
                     return
 
         except Exception as e:
-            print(f"\n❌ 处理消息时出错: {e}")
+            logger.error(f"❌ 处理消息时出错: {e}")
 
     def _process_ticker_data(self, data):
-        """
-        处理ticker数据
-
-        数据格式参考:
-        {
-            "type": "ticker",
-            "sequence": 12345,
-            "product_id": "BTC-USD",
-            "price": "50000.00",
-            "open_24h": "49000.00",
-            "volume_24h": "12055.36",
-            "low_24h": "48767.00",
-            "high_24h": "50500.00",
-            "volume_30d": "365000.00",
-            "best_bid": "49819.48",
-            "best_ask": "49819.49",
-            "side": "buy",
-            "time": "2023-10-01T12:00:00.000000Z",
-            "trade_id": 12345,
-            "last_size": "0.028416"
-        }
-        """
+        """处理ticker数据"""
         try:
             product_id = data['product_id']
             price = float(data['price'])
@@ -188,32 +261,36 @@ class CoinbaseRealtime:
                 'bid': best_bid,
                 'ask': best_ask,
                 'change_24h': change_24h,
-                'trade_id': data.get('trade_id', 0)
+                'trade_id': data.get('trade_id', 0),
+                'last_update': time.time()
             }
-            self.last_prices[product_id] = price
 
-            # 定时更新显示
-            if not hasattr(self, '_last_display'):
-                self._last_display = 0
-
-            if time.time() - self._last_display >= 2:
-                self._last_display = time.time()
+            # 定时更新显示（每2秒）
+            current_time = time.time()
+            if current_time - self.last_display_time >= 2:
+                self.last_display_time = current_time
                 self._display_all_prices()
 
         except (KeyError, ValueError) as e:
-            print(f"❌ 数据格式错误: {e}")
+            logger.error(f"❌ 处理ticker数据出错: {e}")
 
     def _display_all_prices(self):
         """显示所有币种价格汇总（清屏刷新）"""
         import os
-        os.system('cls' if os.name == 'nt' else 'clear')
+        # 首次显示不清屏，后续显示清屏
+        if not self.first_display:
+            os.system('cls' if os.name == 'nt' else 'clear')
+        else:
+            self.first_display = False
 
-        print(f"\n✅ Coinbase Pro WebSocket 实时价格监控")
-        print(f"📡 已订阅 {len(self.symbols)} 个交易对 (Ticker频道)")
+        online_count = self._get_online_count()
+        
+        print(f"\n{COLOR_BOLD}✅ Coinbase Pro WebSocket 实时价格监控 - 动态市值前{self.top_n}名{COLOR_RESET}")
+        print(f"📡 已订阅 {len(self.symbols)} 个交易对 | {COLOR_GREEN}在线 {online_count} 个{COLOR_RESET}")
         print(f"🕐 更新时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-        print("=" * 95)
-        print(f"{COLOR_BLUE}{'排名':<6} | {'交易对':<12} | {'价格 (USD)':<20} | {'24h变化':<15} | {'24h最高':<15} | 状态{COLOR_RESET}")
-        print("-" * 95)
+        print("=" * 100)
+        print(f"{COLOR_BLUE}{'排名':<4} | {'交易对':<12} | {'价格 (USD)':<18} | {'24h变化':<12} | {'24h最高':<18} | {'状态':<8}{COLOR_RESET}")
+        print("-" * 100)
 
         for idx, symbol in enumerate(self.symbols, 1):
             if symbol in self.price_data:
@@ -223,98 +300,169 @@ class CoinbaseRealtime:
                 high_24h = data['high']
 
                 # 格式化价格显示
-                if price >= 10000:
+                if price >= 1000:
                     price_str = f"${price:,.2f}"
                     high_str = f"${high_24h:,.2f}"
                 elif price >= 1:
                     price_str = f"${price:,.4f}"
                     high_str = f"${high_24h:,.4f}"
                 else:
-                    price_str = f"${price:,.8f}"
-                    high_str = f"${high_24h:,.8f}"
+                    price_str = f"${price:,.6f}"
+                    high_str = f"${high_24h:,.6f}"
 
                 # 格式化24h变化
                 if change_24h >= 0:
-                    change_str = f"{COLOR_GREEN}+{change_24h:.2f}%{COLOR_RESET}"
+                    change_str = f"{COLOR_GREEN}▲{change_24h:+.2f}%{COLOR_RESET}"
                 else:
-                    change_str = f"{COLOR_RED}{change_24h:.2f}%{COLOR_RESET}"
+                    change_str = f"{COLOR_RED}▼{change_24h:.2f}%{COLOR_RESET}"
 
-                status = f"{COLOR_GREEN}✓ 实时{COLOR_RESET}"
+                # 检查数据新鲜度
+                last_update = data.get('last_update', 0)
+                if time.time() - last_update < 10:  # 10秒内更新的数据
+                    status = f"{COLOR_GREEN}实时{COLOR_RESET}"
+                else:
+                    status = f"{COLOR_YELLOW}延迟{COLOR_RESET}"
 
-                print(f"{idx:<6} | {COLOR_BOLD}{symbol:<12}{COLOR_RESET} | {price_str:<20} | {change_str:<15} | {high_str:<15} | {status}")
+                print(f"{idx:<4} | {COLOR_BOLD}{symbol:<12}{COLOR_RESET} | {price_str:<18} | {change_str:<12} | {high_str:<18} | {status}")
             else:
-                print(f"{idx:<6} | {COLOR_BOLD}{symbol:<12}{COLOR_RESET} | {COLOR_YELLOW}等待数据...{COLOR_RESET:<20} | {COLOR_RED}离线{COLOR_RESET} | --- | 等待")
+                print(f"{idx:<4} | {COLOR_BOLD}{symbol:<12}{COLOR_RESET} | {COLOR_YELLOW}等待数据...{COLOR_RESET:<18} | {'--':<12} | {'--':<18} | {COLOR_RED}离线{COLOR_RESET}")
 
-        print("=" * 95)
-        print("💡 价格基准: USD (美元)")
-        print("💡 24h数据来源: Coinbase Pro官方API")
-        print("💡 按 Ctrl+C 退出监控")
-        print("=" * 95)
+        print("=" * 100)
+        print(f"📊 数据来源: Coinbase Pro WebSocket API | 市值排名: CoinGecko")
+        print(f"💡 按 Ctrl+C 退出监控 | 自动重连: {self.reconnect_count}/{self.max_reconnect}")
+        print("=" * 100)
+
+    def _get_online_count(self):
+        """获取在线币种数量"""
+        count = 0
+        current_time = time.time()
+        for symbol in self.symbols:
+            if symbol in self.price_data:
+                last_update = self.price_data[symbol].get('last_update', 0)
+                if current_time - last_update < 30:  # 30秒内算在线
+                    count += 1
+        return count
 
     def on_error(self, ws, error):
         """WebSocket错误处理"""
-        print(f"\n❌ WebSocket错误: {error}")
+        logger.error(f"❌ WebSocket错误: {error}")
 
     def on_close(self, ws, close_status_code, close_msg):
         """WebSocket连接关闭"""
+        self.ws_connected = False
         print(f"\n\n⚠️  Coinbase WebSocket连接已关闭")
         print(f"状态码: {close_status_code}, 消息: {close_msg}")
 
         if self.reconnect_count < self.max_reconnect:
-            print(f"🔄 第 {self.reconnect_count + 1}/{self.max_reconnect} 次重连将在 3 秒后进行...")
-            time.sleep(3)
+            print(f"🔄 第 {self.reconnect_count + 1}/{self.max_reconnect} 次重连将在 5 秒后进行...")
+            time.sleep(5)
             self.reconnect_count += 1
             self.start()
         else:
-            print(f"\n❌ 已达到最大重连次数，程序退出")
+            print(f"\n❌ 已达到最大重连次数 {self.max_reconnect}，程序退出")
 
     def on_open(self, ws):
         """WebSocket连接建立"""
+        self.ws_connected = True
         self.reconnect_count = 0
-        self._last_display = 0
+        self.last_display_time = 0
 
         print(f"\n✅ Coinbase WebSocket连接已建立")
-        print(f"📡 正在订阅ticker频道...")
+        print(f"📡 正在订阅 {len(self.symbols)} 个交易对的ticker频道...")
 
-        # 构建订阅消息
-        subscribe_data = {
-            "type": "subscribe",
-            "product_ids": self.symbols,
-            "channels": ["ticker"]
-        }
+        # 分批订阅，避免消息过大
+        batch_size = 10
+        successful_subs = 0
+        
+        for i in range(0, len(self.symbols), batch_size):
+            batch = self.symbols[i:i + batch_size]
+            subscribe_data = {
+                "type": "subscribe",
+                "product_ids": batch,
+                "channels": ["ticker"]
+            }
+            
+            try:
+                ws.send(json.dumps(subscribe_data))
+                print(f"✅ 已发送批次 {i//batch_size + 1}/{(len(self.symbols)-1)//batch_size + 1}")
+                time.sleep(0.5)  # 增加延迟避免速率限制
+                successful_subs += len(batch)
+            except Exception as e:
+                print(f"❌ 发送批次 {i//batch_size + 1} 失败: {e}")
 
-        # 发送订阅消息
-        ws.send(json.dumps(subscribe_data))
-        print(f"✅ 订阅请求已发送，等待数据推送...\n")
-
-        # 等待数据
-        time.sleep(1)
+        print(f"✅ 订阅请求发送完成，成功发送 {successful_subs} 个交易对订阅")
+        print("⏳ 等待数据推送...\n")
 
     def start(self):
         """启动WebSocket连接"""
-        ws = WebSocketApp(
-            self.ws_url,
-            on_open=self.on_open,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close
-        )
-        ws.run_forever()
+        try:
+            ws = WebSocketApp(
+                self.ws_url,
+                on_open=self.on_open,
+                on_message=self.on_message,
+                on_error=self.on_error,
+                on_close=self.on_close
+            )
+            ws.run_forever(ping_interval=20, ping_timeout=10)
+        except Exception as e:
+            logger.error(f"❌ 启动WebSocket失败: {e}")
+            if self.reconnect_count < self.max_reconnect:
+                time.sleep(5)
+                self.reconnect_count += 1
+                self.start()
 
     def run(self):
         """运行监控"""
-        print("🚀 启动Coinbase Pro实时虚拟币价格监控")
-        print("💡 使用Coinbase Pro WebSocket API | Ticker频道推送")
-        print("📊 提供24h价格数据、涨跌幅、最高最低价")
-        print("🌍 价格基准: USD (美元)")
-        print("⌨️  按 Ctrl+C 退出\n")
+        print(f"🚀 启动Coinbase Pro实时虚拟币价格监控 - 优化稳定版")
+        print(f"💡 使用Coinbase Pro WebSocket API | Ticker频道推送")
+        print(f"📊 动态匹配市值前{self.top_n}名币种 | 确保交易对有效")
+        print(f"🌍 价格基准: USD (美元)")
+        print(f"🛡️  自动重连 | 数据新鲜度检测")
+        print(f"⌨️  按 Ctrl+C 退出\n")
 
         try:
             self.start()
         except KeyboardInterrupt:
-            print("\n\n👋 已停止Coinbase Pro实时价格监控")
+            print(f"\n\n👋 已停止Coinbase Pro实时价格监控")
+            if self.ws_connected:
+                print("✅ WebSocket连接已正常关闭")
+
+
+def main():
+    """主函数，处理命令行参数"""
+    parser = argparse.ArgumentParser(description='Coinbase Pro实时虚拟币价格监控')
+    parser.add_argument(
+        'top_n', 
+        type=int, 
+        nargs='?', 
+        default=20,
+        help='监控的币种数量 (默认: 20)'
+    )
+    
+    args = parser.parse_args()
+    
+    # 验证参数
+    if args.top_n <= 0 or args.top_n > 100:
+        print(f"❌ 错误: 币种数量必须在1-100之间")
+        sys.exit(1)
+    
+    # 设置全局超时
+    import socket
+    socket.setdefaulttimeout(15)
+    
+    # 创建并运行监控
+    monitor = CoinbaseRealtime(top_n=args.top_n)
+    
+    try:
+        monitor.run()
+    except KeyboardInterrupt:
+        print(f"\n👋 用户中断程序")
+    except Exception as e:
+        logger.error(f"❌ 程序异常: {e}")
+    finally:
+        if hasattr(monitor, 'stop'):
+            monitor.stop()
 
 
 if __name__ == '__main__':
-    monitor = CoinbaseRealtime()
-    monitor.run()
+    main()

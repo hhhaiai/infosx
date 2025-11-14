@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OKX 实时虚拟币价格获取 - 优化稳定版
+OKX 实时虚拟币价格获取 - 修复版
+动态获取市值前20名币种，确保交易对有效
 依赖: pip install websocket-client requests
 运行: python okx_realtime.py
-
-OKX WebSocket API 公共频道说明:
-- 连接地址: wss://ws.okx.com:8443/ws/v5/public
-- 订阅格式: {"op": "subscribe", "args": [{"channel": "tickers", "instId": "BTC-USDT"}]}
-- 数据格式: 包含价格、涨跌幅、24h交易量等
 """
 
 import json
 import time
 import threading
 import requests
-import logging
 from websocket import WebSocketApp
 from datetime import datetime
 
@@ -27,19 +22,9 @@ COLOR_BLUE = '\033[94m'
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
-# 配置日志
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
-)
-logger = logging.getLogger(__name__)
-
 
 class OKXRealtime:
-    """OKX WebSocket 实时价格监控 - 优化稳定版"""
+    """OKX WebSocket 实时价格监控 - 修复版"""
 
     def __init__(self, top_n=20):
         """
@@ -51,40 +36,40 @@ class OKXRealtime:
         # OKX公共频道WebSocket地址
         self.ws_url = "wss://ws.okx.com:8443/ws/v5/public"
         self.top_n = top_n
-        self.symbols = self._fetch_top_symbols_with_fallback()
-
+        self.symbols = []
+        
         # 存储价格数据
         self.price_data = {}
         self.reconnect_count = 0
         self.max_reconnect = 5
         self.ws_connected = False
         self.last_display_time = 0
-        self.first_display = True
+        
+        # 初始化币种列表
+        self._initialize_symbols()
 
-    def _fetch_top_symbols_with_fallback(self):
-        """
-        动态获取市值前N名币种，带多层回退机制
-        """
+    def _initialize_symbols(self):
+        """初始化币种列表，带重试机制"""
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                logger.info(f"🔄 第 {attempt + 1}/{max_retries} 次尝试获取市值前{self.top_n}名币种...")
-                symbols = self._fetch_valid_okx_symbols()
-                if symbols and len(symbols) >= min(10, self.top_n):
-                    logger.info(f"✅ 成功获取 {len(symbols)} 个有效交易对")
-                    return symbols
+                print(f"🔄 第 {attempt + 1}/{max_retries} 次尝试获取市值前{self.top_n}名币种...")
+                self.symbols = self._fetch_valid_okx_symbols()
+                if self.symbols and len(self.symbols) >= 10:  # 至少获取10个有效交易对
+                    print(f"✅ 成功获取 {len(self.symbols)} 个有效交易对")
+                    return
                 else:
-                    logger.warning(f"⚠️ 第 {attempt + 1} 次获取失败，有效交易对数量不足")
+                    print(f"⚠️ 第 {attempt + 1} 次获取失败，有效交易对数量不足")
                     if attempt < max_retries - 1:
                         time.sleep(2)
             except Exception as e:
-                logger.error(f"❌ 获取币种列表出错: {e}")
+                print(f"❌ 获取币种列表出错: {e}")
                 if attempt < max_retries - 1:
                     time.sleep(2)
         
         # 如果所有重试都失败，使用硬编码的备用列表
-        logger.warning("⚠️ 使用备用币种列表")
-        return self._get_fallback_symbols()
+        print("⚠️ 使用备用币种列表")
+        self.symbols = self._get_fallback_symbols()
 
     def _fetch_valid_okx_symbols(self):
         """
@@ -97,33 +82,38 @@ class OKXRealtime:
                 return None
             
             # 获取市值排名
-            top_coins = self._fetch_market_cap_ranking(self.top_n * 2)
+            top_coins = self._fetch_market_cap_ranking(self.top_n * 2)  # 多获取一些
             if not top_coins:
-                return list(okx_symbols)[:self.top_n]
+                return list(okx_symbols)[:self.top_n]  # 返回OKX的前N个交易对
             
             # 匹配：找到市值排名中在OKX可用的交易对
             valid_symbols = []
+            used_symbols = set()
             
             for coin in top_coins:
-                symbol = coin['symbol'].upper()
-                possible_symbol = f"{symbol}-USDT"
+                # 尝试多种可能的符号匹配
+                possible_symbols = self._get_possible_symbols(coin)
                 
-                if possible_symbol in okx_symbols:
-                    valid_symbols.append(possible_symbol)
-                    if len(valid_symbols) >= self.top_n:
+                for symbol in possible_symbols:
+                    if symbol in okx_symbols and symbol not in used_symbols:
+                        valid_symbols.append(symbol)
+                        used_symbols.add(symbol)
                         break
+                
+                if len(valid_symbols) >= self.top_n:
+                    break
             
-            logger.info(f"📊 匹配到 {len(valid_symbols)} 个有效交易对")
+            print(f"📊 匹配到 {len(valid_symbols)} 个有效交易对")
             return valid_symbols[:self.top_n]
             
         except Exception as e:
-            logger.error(f"❌ 获取有效交易对失败: {e}")
+            print(f"❌ 获取有效交易对失败: {e}")
             return None
 
     def _fetch_okx_spot_symbols(self):
         """从OKX API获取所有可用的现货交易对"""
         try:
-            logger.info("📊 获取OKX现货交易对列表...")
+            print("📊 获取OKX现货交易对列表...")
             url = "https://www.okx.com/api/v5/public/instruments"
             params = {'instType': 'SPOT'}
             
@@ -139,20 +129,26 @@ class OKXRealtime:
             for instrument in data['data']:
                 inst_id = instrument['instId']
                 if (inst_id.endswith('-USDT') and 
-                    instrument['state'] == 'live'):
+                    instrument['state'] == 'live' and 
+                    not self._is_wrapped_token(inst_id)):
                     usdt_pairs.add(inst_id)
             
-            logger.info(f"✅ OKX返回 {len(usdt_pairs)} 个可用USDT交易对")
+            print(f"✅ OKX返回 {len(usdt_pairs)} 个可用USDT交易对")
             return usdt_pairs
             
         except Exception as e:
-            logger.error(f"❌ 获取OKX交易对失败: {e}")
+            print(f"❌ 获取OKX交易对失败: {e}")
             return None
+
+    def _is_wrapped_token(self, symbol):
+        """检查是否为包装代币（通常流动性较差）"""
+        wrapped_keywords = ['WSTETH', 'WBTC', 'WETH', 'WEETH', 'WLD', 'WBTC', 'W']
+        return any(keyword in symbol for keyword in wrapped_keywords)
 
     def _fetch_market_cap_ranking(self, limit=40):
         """获取市值排名"""
         try:
-            logger.info("📈 获取市值排名...")
+            print("📈 获取市值排名...")
             url = "https://api.coingecko.com/api/v3/coins/markets"
             params = {
                 'vs_currency': 'usd',
@@ -174,21 +170,89 @@ class OKXRealtime:
             for coin in data:
                 symbol_lower = coin['symbol'].lower()
                 if (symbol_lower not in stablecoins and 
-                    len(symbol_lower) <= 8 and
-                    symbol_lower.isalpha()):
+                    not self._is_wrapped_token(coin['symbol'].upper())):
                     filtered_coins.append({
                         'id': coin['id'],
-                        'symbol': coin['symbol'],
+                        'symbol': coin['symbol'].upper(),
                         'name': coin['name'],
                         'market_cap_rank': coin['market_cap_rank']
                     })
             
-            logger.info(f"✅ 获取到 {len(filtered_coins)} 个有效币种排名")
+            print(f"✅ 获取到 {len(filtered_coins)} 个有效币种排名")
             return filtered_coins
             
         except Exception as e:
-            logger.error(f"❌ 获取市值排名失败: {e}")
+            print(f"❌ 获取市值排名失败: {e}")
             return None
+
+    def _get_possible_symbols(self, coin):
+        """为币种生成可能的交易对符号"""
+        symbol = coin['symbol'].upper()
+        name = coin['name'].upper()
+        
+        possible_symbols = []
+        
+        # 主要使用符号
+        possible_symbols.append(f"{symbol}-USDT")
+        
+        # 对于名称与符号不同的币种，也尝试名称
+        if symbol != name and len(name) <= 8:
+            # 移除常见前缀后缀
+            clean_name = name.replace(' ', '')
+            for prefix in ['THE ', 'NEW ', 'OLD ']:
+                if clean_name.startswith(prefix):
+                    clean_name = clean_name[len(prefix):]
+            
+            if clean_name and clean_name != symbol:
+                possible_symbols.append(f"{clean_name}-USDT")
+        
+        # 特殊处理一些知名币种
+        special_cases = {
+            'BTC': ['BTC-USDT', 'XBT-USDT'],
+            'ETH': ['ETH-USDT'],
+            'BNB': ['BNB-USDT'],
+            'XRP': ['XRP-USDT'],
+            'ADA': ['ADA-USDT'],
+            'SOL': ['SOL-USDT'],
+            'DOT': ['DOT-USDT'],
+            'DOGE': ['DOGE-USDT', 'XDG-USDT'],
+            'MATIC': ['MATIC-USDT', 'POL-USDT'],
+            'LTC': ['LTC-USDT'],
+            'BCH': ['BCH-USDT', 'BCC-USDT'],
+            'LINK': ['LINK-USDT'],
+            'XLM': ['XLM-USDT'],
+            'UNI': ['UNI-USDT'],
+            'ATOM': ['ATOM-USDT'],
+            'ETC': ['ETC-USDT'],
+            'XMR': ['XMR-USDT'],
+            'XTZ': ['XTZ-USDT'],
+            'EOS': ['EOS-USDT'],
+            'AAVE': ['AAVE-USDT'],
+            'ALGO': ['ALGO-USDT'],
+            'TRX': ['TRX-USDT'],
+            'FIL': ['FIL-USDT'],
+            'AVAX': ['AVAX-USDT'],
+            'ICP': ['ICP-USDT'],
+            'APE': ['APE-USDT'],
+            'NEAR': ['NEAR-USDT'],
+            'QNT': ['QNT-USDT'],
+            'CHZ': ['CHZ-USDT'],
+            'FTM': ['FTM-USDT'],
+            'GRT': ['GRT-USDT'],
+            'SAND': ['SAND-USDT'],
+            'MANA': ['MANA-USDT'],
+            'ENJ': ['ENJ-USDT'],
+            'BAT': ['BAT-USDT'],
+            'ZEC': ['ZEC-USDT'],
+            'DASH': ['DASH-USDT'],
+            'ZIL': ['ZIL-USDT'],
+            'IOTA': ['IOTA-USDT', 'MIOTA-USDT'],
+        }
+        
+        if symbol in special_cases:
+            possible_symbols.extend(special_cases[symbol])
+        
+        return possible_symbols
 
     def _get_fallback_symbols(self):
         """获取备用币种列表（确保在OKX上存在）"""
@@ -208,9 +272,9 @@ class OKXRealtime:
             # 处理订阅响应
             if 'event' in data:
                 if data['event'] == 'subscribe':
-                    logger.info(f"✅ 订阅成功: {data['arg']['channel']} - {data['arg']['instId']}")
+                    print(f"✅ 订阅成功: {data['arg']['channel']} - {data['arg']['instId']}")
                 elif data['event'] == 'error':
-                    logger.error(f"❌ 订阅错误: {data.get('msg', '未知错误')} - {data.get('arg', {})}")
+                    print(f"❌ 订阅错误: {data.get('msg', '未知错误')} - {data.get('arg', {})}")
                 return
 
             # 处理ticker数据推送
@@ -219,7 +283,7 @@ class OKXRealtime:
                     self._process_ticker_data(ticker_data)
 
         except Exception as e:
-            logger.error(f"❌ 处理消息时出错: {e}")
+            print(f"\n❌ 处理消息时出错: {e}")
 
     def _process_ticker_data(self, data):
         """处理ticker数据"""
@@ -261,16 +325,12 @@ class OKXRealtime:
                 self._display_all_prices()
 
         except (KeyError, ValueError) as e:
-            logger.error(f"❌ 处理ticker数据出错: {e}")
+            print(f"❌ 处理ticker数据出错: {e}")
 
     def _display_all_prices(self):
         """显示所有币种价格汇总（清屏刷新）"""
         import os
-        # 首次显示不清屏，后续显示清屏
-        if not self.first_display:
-            os.system('cls' if os.name == 'nt' else 'clear')
-        else:
-            self.first_display = False
+        os.system('cls' if os.name == 'nt' else 'clear')
 
         online_count = self._get_online_count()
         
@@ -334,7 +394,7 @@ class OKXRealtime:
 
     def on_error(self, ws, error):
         """WebSocket错误处理"""
-        logger.error(f"❌ WebSocket错误: {error}")
+        print(f"\n❌ WebSocket错误: {error}")
 
     def on_close(self, ws, close_status_code, close_msg):
         """WebSocket连接关闭"""
@@ -360,7 +420,7 @@ class OKXRealtime:
         print(f"📡 正在订阅 {len(self.symbols)} 个交易对的ticker频道...")
 
         # 分批订阅，避免消息过大
-        batch_size = 5
+        batch_size = 5  # 更小的批次避免订阅错误
         successful_subs = 0
         
         for i in range(0, len(self.symbols), batch_size):
@@ -378,7 +438,7 @@ class OKXRealtime:
             except Exception as e:
                 print(f"❌ 发送批次 {i//batch_size + 1} 失败: {e}")
 
-        print(f"✅ 订阅请求发送完成，成功发送 {successful_subs} 个交易对订阅")
+        print(f"✅ 订阅请求发送完成，成功订阅 {successful_subs} 个交易对")
         print("⏳ 等待数据推送...\n")
 
     def start(self):
@@ -393,7 +453,7 @@ class OKXRealtime:
             )
             ws.run_forever(ping_interval=20, ping_timeout=10)
         except Exception as e:
-            logger.error(f"❌ 启动WebSocket失败: {e}")
+            print(f"❌ 启动WebSocket失败: {e}")
             if self.reconnect_count < self.max_reconnect:
                 time.sleep(5)
                 self.reconnect_count += 1
@@ -401,7 +461,7 @@ class OKXRealtime:
 
     def run(self):
         """运行监控"""
-        print("🚀 启动OKX实时虚拟币价格监控 - 优化稳定版")
+        print("🚀 启动OKX实时虚拟币价格监控 - 修复版")
         print("💡 使用OKX WebSocket API | Ticker频道推送")
         print("📊 动态匹配市值前20名币种 | 确保交易对有效")
         print("🛡️  自动重连 | 数据新鲜度检测")
