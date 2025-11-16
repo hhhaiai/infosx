@@ -1,410 +1,320 @@
-"""
-pip install requests pandas matplotlib
-
-"""
 import requests
-import time
-import json
-from typing import List, Dict, Optional, Tuple
-from datetime import datetime, timedelta
-import matplotlib.pyplot as plt
 import pandas as pd
-from io import StringIO
+from typing import List, Dict, Optional
+from datetime import datetime
+import matplotlib.pyplot as plt
+import time
+import random
 
 
-class CoinGeckoAPI:
-    """CoinGecko API 封装类"""
-
+class CryptoDataFetcher:
+    """加密货币数据获取器 - 修复版"""
+    
     BASE_URL = "https://api.coingecko.com/api/v3"
-
+    
     def __init__(self):
         self.session = requests.Session()
         self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9'
         })
+        self.request_count = 0
+        self.last_request_time = 0
+
+    def _rate_limit(self):
+        """速率限制，避免API限制"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_request_time
+        
+        # 免费API限制：10-30次/分钟，我们保守一点
+        if time_since_last < 2:  # 至少2秒间隔
+            time.sleep(2 - time_since_last)
+        
+        self.last_request_time = time.time()
+        self.request_count += 1
+        
+        # 每10次请求后等待更长时间
+        if self.request_count % 10 == 0:
+            time.sleep(5)
 
     def get_top_coins(self, limit: int = 50, currency: str = 'usd') -> List[Dict]:
         """
-        获取热门虚拟币排行、价格及简要走势
-
-        Args:
-            limit: 返回的币种数量
-            currency: 计价货币
-
-        Returns:
-            币种信息列表
+        获取主流Top N币种信息
         """
+        self._rate_limit()
+        
         url = f"{self.BASE_URL}/coins/markets"
         params = {
             'vs_currency': currency,
             'order': 'market_cap_desc',
             'per_page': limit,
             'page': 1,
-            'sparkline': 'true',  # 包含简要走势数据
-            'price_change_percentage': '1h,24h,7d,30d'
+            'sparkline': 'false',
+            'price_change_percentage': '1h,24h,7d,30d,200d,1y'
         }
-
+        
         try:
             response = self.session.get(url, params=params, timeout=10)
+            
+            if response.status_code == 429:
+                print("⚠️  API速率限制，等待60秒后重试...")
+                time.sleep(60)
+                return self.get_top_coins(limit, currency)
+                
             response.raise_for_status()
             return response.json()
+            
+        except requests.exceptions.RequestException as e:
+            print(f"❌ API请求错误: {e}")
+            return []
         except Exception as e:
-            print(f"CoinGecko API 错误: {e}")
+            print(f"❌ 未知错误: {e}")
             return []
 
-    def get_coin_history(self, coin_id: str, days: str = 'max', currency: str = 'usd') -> Optional[Dict]:
+    def get_coin_history(self, coin_id: str, days: str = '365', currency: str = 'usd') -> Optional[pd.DataFrame]:
         """
-        获取币种历史价格数据
-
-        Args:
-            coin_id: 币种ID (如: 'bitcoin')
-            days: 数据天数 ('1', '7', '30', '90', '365', 'max')
-            currency: 计价货币
-
-        Returns:
-            历史价格数据
+        获取币种历史价格数据 - 修复版本
+        
+        注意：免费API有天数限制，建议使用365天以内
         """
+        self._rate_limit()
+        
+        # 免费API限制：不能直接获取所有历史数据，最大支持365天
+        if days == 'max':
+            days = '365'
+            print("⚠️  免费API限制：最多获取365天数据")
+        
         url = f"{self.BASE_URL}/coins/{coin_id}/market_chart"
         params = {
             'vs_currency': currency,
             'days': days,
-            'interval': 'daily' if days != '1' else 'hourly'
+            'interval': 'daily'
         }
-
+        
         try:
             response = self.session.get(url, params=params, timeout=15)
+            
+            if response.status_code == 429:
+                print("⚠️  API速率限制，等待60秒后重试...")
+                time.sleep(60)
+                return self.get_coin_history(coin_id, days, currency)
+                
             response.raise_for_status()
             data = response.json()
-
-            # 格式化历史数据
-            history_data = {
-                'prices': data.get('prices', []),
-                'market_caps': data.get('market_caps', []),
-                'total_volumes': data.get('total_volumes', [])
-            }
-
-            return history_data
+            
+            # 转换为DataFrame
+            prices = data.get('prices', [])
+            if not prices:
+                print("❌ 没有获取到价格数据")
+                return None
+                
+            df = pd.DataFrame(prices, columns=['timestamp', 'price'])
+            df['datetime'] = pd.to_datetime(df['timestamp'], unit='ms')
+            df.set_index('datetime', inplace=True)
+            df.drop('timestamp', axis=1, inplace=True)
+            
+            print(f"✅ 成功获取 {len(df)} 条历史价格数据")
+            return df
+            
+        except requests.exceptions.RequestException as e:
+            print(f"❌ 历史数据获取错误: {e}")
+            if hasattr(e, 'response') and e.response.status_code == 404:
+                print("❌ 币种ID不存在，请检查币种名称")
+            return None
         except Exception as e:
-            print(f"CoinGecko 历史数据获取错误: {e}")
+            print(f"❌ 未知错误: {e}")
             return None
 
-    def get_coin_detail(self, coin_id: str) -> Optional[Dict]:
-        """获取币种详细信息"""
-        url = f"{self.BASE_URL}/coins/{coin_id}"
-        params = {
-            'localization': 'false',
-            'tickers': 'false',
-            'market_data': 'true',
-            'community_data': 'false',
-            'developer_data': 'false',
-            'sparkline': 'false'
-        }
-
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            print(f"CoinGecko 详情获取错误: {e}")
-            return None
-
-    def search_coins(self, query: str) -> List[Dict]:
-        """搜索币种"""
+    def search_coin(self, query: str) -> Optional[Dict]:
+        """搜索币种信息"""
+        self._rate_limit()
+        
         url = f"{self.BASE_URL}/search"
         params = {'query': query}
-
+        
         try:
             response = self.session.get(url, params=params, timeout=10)
+            
+            if response.status_code == 429:
+                print("⚠️  API速率限制，等待60秒后重试...")
+                time.sleep(60)
+                return self.search_coin(query)
+                
             response.raise_for_status()
             data = response.json()
-            return data.get('coins', [])
-        except Exception as e:
-            print(f"CoinGecko 搜索错误: {e}")
-            return []
-
-
-class CoinMarketCapAPI:
-    """CoinMarketCap API 封装类"""
-
-    BASE_URL = "https://pro-api.coinmarketcap.com/v1"
-
-    def __init__(self, api_key: str = None):
-        """
-        初始化 CoinMarketCap API
-
-        Args:
-            api_key: API密钥 (免费版可从官网获取)
-        """
-        self.api_key = api_key or 'your-api-key-here'  # 需要从官网申请免费API密钥
-        self.session = requests.Session()
-        self.session.headers.update({
-            'X-CMC_PRO_API_KEY': self.api_key,
-            'Accept': 'application/json',
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        })
-
-    def get_top_coins(self, limit: int = 50, currency: str = 'USD') -> List[Dict]:
-        """
-        获取热门虚拟币排行及价格
-
-        Args:
-            limit: 返回的币种数量
-            currency: 计价货币
-
-        Returns:
-            币种信息列表
-        """
-        url = f"{self.BASE_URL}/cryptocurrency/listings/latest"
-        params = {
-            'start': 1,
-            'limit': limit,
-            'convert': currency,
-            'sort': 'market_cap',
-            'sort_dir': 'desc'
-        }
-
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            return data.get('data', [])
-        except Exception as e:
-            print(f"CoinMarketCap API 错误: {e}")
-            if response.status_code == 401:
-                print("请检查 API 密钥是否正确")
-            return []
-
-    def get_coin_history(self, coin_id: int, time_start: str = None,
-                        time_end: str = None, count: int = 365,
-                        interval: str = 'daily') -> Optional[Dict]:
-        """
-        获取币种历史价格数据
-
-        Args:
-            coin_id: 币种ID
-            time_start: 开始时间 (格式: YYYY-MM-DD)
-            time_end: 结束时间 (格式: YYYY-MM-DD)
-            count: 数据点数
-            interval: 时间间隔 ('daily', 'hourly', 'weekly', 'monthly')
-
-        Returns:
-            历史价格数据
-        """
-        # 设置默认时间范围（最近一年）
-        if not time_end:
-            time_end = datetime.now().strftime('%Y-%m-%d')
-        if not time_start:
-            start_date = datetime.now() - timedelta(days=count)
-            time_start = start_date.strftime('%Y-%m-%d')
-
-        url = f"{self.BASE_URL}/cryptocurrency/quotes/historical"
-        params = {
-            'id': coin_id,
-            'time_start': time_start,
-            'time_end': time_end,
-            'count': count,
-            'interval': interval,
-            'convert': 'USD'
-        }
-
-        try:
-            response = self.session.get(url, params=params, timeout=15)
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            print(f"CoinMarketCap 历史数据获取错误: {e}")
-            return None
-
-    def get_coin_metadata(self, coin_id: int) -> Optional[Dict]:
-        """获取币种元数据"""
-        url = f"{self.BASE_URL}/cryptocurrency/info"
-        params = {'id': coin_id}
-
-        try:
-            response = self.session.get(url, params=params, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            return data.get('data', {}).get(str(coin_id))
-        except Exception as e:
-            print(f"CoinMarketCap 元数据获取错误: {e}")
+            coins = data.get('coins', [])
+            
+            if coins:
+                print(f"✅ 找到币种: {coins[0]['name']} (ID: {coins[0]['id']})")
+                return coins[0]
+            else:
+                print("❌ 未找到匹配的币种")
+                return None
+                
+        except requests.exceptions.RequestException as e:
+            print(f"❌ 搜索错误: {e}")
             return None
 
 
-class CryptoDataAnalyzer:
-    """加密货币数据分析器"""
-
+class CryptoAnalyzer:
+    """加密货币分析器 - 修复版"""
+    
     def __init__(self):
-        self.gecko_api = CoinGeckoAPI()
-        self.cmc_api = CoinMarketCapAPI()  # 需要设置有效的API密钥
+        self.fetcher = CryptoDataFetcher()
 
-    def display_top_coins_comparison(self, limit: int = 20):
-        """比较两个API的Top币种数据"""
-        print("🔍 比较 CoinGecko 和 CoinMarketCap 数据")
-        print("=" * 100)
+    def display_top_coins(self, limit: int = 20, currency: str = 'usd'):
+        """显示Top N币种信息"""
+        print(f"\n🔄 正在获取Top {limit}加密货币数据...")
+        coins = self.fetcher.get_top_coins(limit, currency)
+        
+        if not coins:
+            print("❌ 无法获取数据，请检查网络连接或稍后重试")
+            return
+        
+        print(f"\n🏆 加密货币Top {limit} ({currency.upper()})")
+        print("=" * 120)
+        print(f"{'排名':<4} {'名称':<20} {'代码':<8} {'当前价格':<12} {'1小时':<8} {'24小时':<8} {'7天':<8} {'30天':<8}")
+        print("-" * 120)
+        
+        for coin in coins:
+            rank = coin.get('market_cap_rank', 'N/A')
+            name = coin.get('name', '')[:18]
+            symbol = coin.get('symbol', '').upper()
+            price = coin.get('current_price', 0)
+            
+            # 价格变化百分比
+            change_1h = coin.get('price_change_percentage_1h_in_currency', 0) or 0
+            change_24h = coin.get('price_change_percentage_24h_in_currency', 0) or 0
+            change_7d = coin.get('price_change_percentage_7d_in_currency', 0) or 0
+            change_30d = coin.get('price_change_percentage_30d_in_currency', 0) or 0
+            
+            print(f"{rank:<4} {name:<20} {symbol:<8} {price:>10.2f} {change_1h:>+7.1f}% {change_24h:>+7.1f}% "
+                  f"{change_7d:>+7.1f}% {change_30d:>+7.1f}%")
 
-        # 获取两个API的数据
-        gecko_data = self.gecko_api.get_top_coins(limit)
-        cmc_data = self.cmc_api.get_top_coins(limit)
-
-        print(f"{'Rank':<4} {'Coin':<20} {'Gecko Price':<15} {'CMC Price':<15} {'24h Change':<12}")
-        print("-" * 100)
-
-        for i, (gecko_coin, cmc_coin) in enumerate(zip(gecko_data, cmc_data)):
-            rank = i + 1
-            name = gecko_coin.get('name', 'Unknown')[:18]
-
-            # CoinGecko 数据
-            gecko_price = gecko_coin.get('current_price', 0)
-            gecko_change = gecko_coin.get('price_change_percentage_24h', 0)
-
-            # CoinMarketCap 数据
-            cmc_price = cmc_coin.get('quote', {}).get('USD', {}).get('price', 0)
-            cmc_change = cmc_coin.get('quote', {}).get('USD', {}).get('percent_change_24h', 0)
-
-            print(f"{rank:<4} {name:<20} ${gecko_price:<14.2f} ${cmc_price:<14.2f} "
-                  f"{gecko_change:+.2f}%/{cmc_change:+.2f}%")
-
-    def analyze_coin_history(self, coin_id: str, coin_name: str, days: str = '365'):
+    def analyze_coin_history(self, coin_query: str, currency: str = 'usd', days: str = '365'):
         """分析币种历史走势"""
-        print(f"\n📈 分析 {coin_name} 的历史走势 ({days}天)")
-
+        print(f"\n🔍 正在搜索币种: {coin_query}")
+        
+        # 搜索币种
+        coin_info = self.fetcher.search_coin(coin_query)
+        if not coin_info:
+            return None
+        
+        coin_id = coin_info['id']
+        coin_name = coin_info['name']
+        
+        print(f"\n📈 正在获取 {coin_name} 的历史价格数据 ({days}天)...")
+        
         # 获取历史数据
-        history = self.gecko_api.get_coin_history(coin_id, days)
+        df = self.fetcher.get_coin_history(coin_id, days, currency)
+        
+        if df is None or df.empty:
+            return None
+        
+        # 显示数据统计
+        self._display_history_stats(df, coin_name, currency)
+        
+        # 显示数据预览
+        self._display_data_preview(df, currency)
+        
+        # 绘制价格走势
+        self._plot_price_history(df, coin_name, currency)
+        
+        return df
 
-        if not history or 'prices' not in history:
-            print("无法获取历史数据")
-            return
-
-        prices = history['prices']
-
-        if not prices:
-            print("没有可用的价格数据")
-            return
-
-        # 转换为DataFrame
-        df = pd.DataFrame(prices, columns=['timestamp', 'price'])
-        df['date'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('date', inplace=True)
-
-        # 计算统计信息
+    def _display_history_stats(self, df: pd.DataFrame, coin_name: str, currency: str):
+        """显示历史数据统计"""
+        print(f"\n📊 {coin_name} 历史数据统计:")
+        print("-" * 50)
+        
         start_price = df['price'].iloc[0]
         end_price = df['price'].iloc[-1]
         max_price = df['price'].max()
         min_price = df['price'].min()
         total_change = ((end_price - start_price) / start_price) * 100
+        
+        print(f"时间范围: {df.index[0].strftime('%Y-%m-%d')} 至 {df.index[-1].strftime('%Y-%m-%d')}")
+        print(f"数据点数: {len(df):,}")
+        print(f"起始价格: {start_price:.2f} {currency.upper()}")
+        print(f"当前价格: {end_price:.2f} {currency.upper()}")
+        print(f"历史最高: {max_price:.2f} {currency.upper()}")
+        print(f"历史最低: {min_price:.2f} {currency.upper()}")
+        print(f"累计涨跌: {total_change:+.2f}%")
 
-        print(f"📊 {coin_name} 历史数据统计:")
-        print(f"   开始价格: ${start_price:.2f}")
-        print(f"   结束价格: ${end_price:.2f}")
-        print(f"   最高价格: ${max_price:.2f}")
-        print(f"   最低价格: ${min_price:.2f}")
-        print(f"   总变化: {total_change:+.2f}%")
-        print(f"   数据点数: {len(df)}")
+    def _display_data_preview(self, df: pd.DataFrame, currency: str):
+        """显示数据预览"""
+        print(f"\n📋 数据预览:")
+        print("-" * 40)
+        
+        # 显示前5条
+        print("最早的数据:")
+        for i in range(min(5, len(df))):
+            date = df.index[i].strftime('%Y-%m-%d')
+            price = df['price'].iloc[i]
+            print(f"  {date}: {price:.2f} {currency.upper()}")
+        
+        # 显示后5条  
+        print("\n最新的数据:")
+        for i in range(max(0, len(df)-5), len(df)):
+            date = df.index[i].strftime('%Y-%m-%d')
+            price = df['price'].iloc[i]
+            print(f"  {date}: {price:.2f} {currency.upper()}")
 
-        # 绘制价格走势图
-        plt.figure(figsize=(12, 6))
-        plt.plot(df.index, df['price'], linewidth=1)
-        plt.title(f'{coin_name} Price History ({days} days)')
-        plt.xlabel('Date')
-        plt.ylabel('Price (USD)')
-        plt.grid(True, alpha=0.3)
-        plt.tight_layout()
-        plt.show()
-
-        return df
-
-    def get_trending_coins(self) -> List[Dict]:
-        """获取 trending 币种"""
-        url = "https://api.coingecko.com/api/v3/search/trending"
-
+    def _plot_price_history(self, df: pd.DataFrame, coin_name: str, currency: str):
+        """绘制价格历史图表"""
         try:
-            response = self.gecko_api.session.get(url, timeout=10)
-            response.raise_for_status()
-            data = response.json()
-            return data.get('coins', [])
+            plt.figure(figsize=(12, 6))
+            plt.plot(df.index, df['price'], linewidth=1, color='#007acc')
+            plt.title(f'{coin_name} 价格历史走势', fontsize=14, fontweight='bold')
+            plt.xlabel('日期')
+            plt.ylabel(f'价格 ({currency.upper()})')
+            plt.grid(True, alpha=0.3)
+            plt.tight_layout()
+            plt.show()
         except Exception as e:
-            print(f"获取 trending 币种错误: {e}")
-            return []
+            print(f"❌ 图表绘制失败: {e}")
 
 
 def main():
-    """主函数示例"""
-    analyzer = CryptoDataAnalyzer()
-
+    """主函数"""
+    analyzer = CryptoAnalyzer()
+    
     while True:
         print("\n" + "="*50)
         print("💰 加密货币数据分析工具")
         print("="*50)
-        print("1. 显示热门币种排行")
+        print("1. 显示Top N币种排行")
         print("2. 分析币种历史走势")
-        print("3. 显示 Trending 币种")
-        print("4. 比较两个API数据")
-        print("5. 退出")
-
-        choice = input("\n请选择功能 (1-5): ").strip()
-
+        print("3. 退出")
+        
+        choice = input("\n请选择功能 (1-3): ").strip()
+        
         if choice == '1':
-            # 显示热门币种
-            coins = analyzer.gecko_api.get_top_coins(20)
-            print(f"\n🏆 热门加密货币排行 (前20)")
-            print("="*80)
-            print(f"{'Rank':<4} {'Coin':<20} {'Symbol':<8} {'Price (USD)':<12} {'24h Change':<12} {'7d Change':<12}")
-            print("-"*80)
-
-            for i, coin in enumerate(coins):
-                rank = coin.get('market_cap_rank', i+1)
-                name = coin.get('name', 'Unknown')[:18]
-                symbol = coin.get('symbol', '').upper()
-                price = coin.get('current_price', 0)
-                change_24h = coin.get('price_change_percentage_24h', 0)
-                change_7d = coin.get('price_change_percentage_7d', 0)
-
-                print(f"{rank:<4} {name:<20} {symbol:<8} ${price:<11.2f} "
-                      f"{change_24h:+.2f}%{'':<6} {change_7d:+.2f}%")
-
+            try:
+                limit = int(input("显示前多少名? (默认20): ") or "20")
+                currency = input("计价货币? (usd/cny, 默认usd): ").lower() or "usd"
+                analyzer.display_top_coins(limit, currency)
+            except ValueError:
+                print("❌ 输入无效，使用默认值")
+                analyzer.display_top_coins()
+                
         elif choice == '2':
-            # 分析历史走势
-            coin_name = input("请输入币种名称 (如: bitcoin, ethereum): ").strip().lower()
-            days = input("请输入天数 (1, 7, 30, 90, 365, max) [默认365]: ").strip() or '365'
-
-            # 搜索币种
-            search_results = analyzer.gecko_api.search_coins(coin_name)
-            if search_results:
-                coin = search_results[0]  # 取第一个结果
-                coin_id = coin['id']
-                display_name = coin['name']
-
-                print(f"🔍 找到币种: {display_name} (ID: {coin_id})")
-                analyzer.analyze_coin_history(coin_id, display_name, days)
+            coin_name = input("请输入币种名称或代码 (如: bitcoin/btc): ").strip()
+            if coin_name:
+                currency = input("计价货币? (usd/cny, 默认usd): ").lower() or "usd"
+                days = input("数据天数? (7/30/90/365, 默认365): ").strip() or "365"
+                analyzer.analyze_coin_history(coin_name, currency, days)
             else:
-                print("❌ 未找到该币种")
-
+                print("❌ 请输入有效的币种名称")
+                
         elif choice == '3':
-            # 显示 trending 币种
-            trending = analyzer.get_trending_coins()
-            print(f"\n🔥 当前 Trending 币种")
-            print("="*60)
-
-            for i, item in enumerate(trending[:10]):
-                coin = item['item']
-                name = coin['name']
-                symbol = coin['symbol'].upper()
-                market_cap_rank = coin.get('market_cap_rank', 'N/A')
-
-                print(f"{i+1:>2}. {name:<20} {symbol:<8} (Rank: {market_cap_rank})")
-
-        elif choice == '4':
-            # 比较两个API
-            analyzer.display_top_coins_comparison(10)
-
-        elif choice == '5':
             print("👋 感谢使用！")
             break
-
+            
         else:
-            print("❌ 无效选择，请重新输入")
-
+            print("❌ 无效选择")
+        
         input("\n按回车键继续...")
 
 
