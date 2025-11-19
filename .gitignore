@@ -65,3 +65,5 @@ package-lock.json
 .$*
 *.drawio.bkp
 *.db
+
+__pycache__
