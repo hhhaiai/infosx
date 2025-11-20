@@ -91,6 +91,9 @@ async def inference_loop():
                     )
                     
                     if features is None: continue
+                    
+                    # DEBUG: Print features
+                    # print(f"DEBUG Features: {features}")
 
                     # ONNX 推理
                     # 输入形状必须是 (1, N_Features)
@@ -107,7 +110,7 @@ async def inference_loop():
                     else:
                         # 仅为了展示存活，偶尔打印
                         if np.random.random() < 0.05:
-                            print(f"💤 观望中... | 概率: {buy_prob:.4f}")
+                            print(f"💤 观望中... | 概率: {buy_prob:.4f}________________________价格: {mid_price:.2f}")
 
             except Exception as e:
                 print(f"Error: {e}")

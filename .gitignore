@@ -67,3 +67,5 @@ package-lock.json
 *.db
 
 __pycache__
+data/
+model/

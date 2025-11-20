@@ -95,6 +95,8 @@ class FeatureEngine:
                 deltas = np.diff(prices[-15:]) # 取最后15个点算14个差值
                 gains = deltas[deltas > 0].sum()
                 losses = -deltas[deltas < 0].sum()
+                # # DEBUG RSI
+                # print(f"DEBUG RSI: deltas={deltas}, gains={gains}, losses={losses}")
                 if losses == 0:
                     rsi = 100.0 if gains > 0 else 50.0
                 else:

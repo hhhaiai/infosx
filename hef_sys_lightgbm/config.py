@@ -8,6 +8,7 @@ LABEL_THRESHOLD = 0.0005
 # 预测视野: 未来 10 个 Tick (约 1-2 秒)
 PREDICT_HORIZON = 10
 
+
 # --- 路径配置 ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
