@@ -10,6 +10,7 @@ import config
 
 WS_URL = "wss://ws.okx.com:8443/ws/v5/public"
 
+# 内存缓存：记录最近一笔成交信息
 last_trade_state = {
     "px": 0.0,
     "sz": 0.0,
@@ -17,8 +18,9 @@ last_trade_state = {
 }
 
 async def record_loop():
-    print(f"🚀 [Collector] 启动录制 (LGBM版): {config.SYMBOL}")
+    print(f"🚀 [Collector] 启动录制: {config.SYMBOL}")
     
+    # 初始化文件名
     current_date = datetime.now().strftime('%Y%m%d')
     file_path = os.path.join(config.DATA_DIR, f"{config.SYMBOL}_{current_date}.csv")
     
@@ -29,8 +31,11 @@ async def record_loop():
         "lt_px", "lt_sz", "lt_side"
     ]
 
+    # buffering=1: 行缓冲，来一行写一行，防数据丢失
     f = open(file_path, 'a+', newline='', buffering=1)
     writer = csv.writer(f)
+    
+    # 如果是新文件，写入表头
     if os.path.getsize(file_path) == 0:
         writer.writerow(headers)
 
@@ -46,7 +51,7 @@ async def record_loop():
         try:
             async with websockets.connect(WS_URL) as ws:
                 await ws.send(json.dumps(subscribe_msg))
-                print(f"✅ [Collector] WebSocket 已连接")
+                print(f"✅ [Collector] WebSocket 已连接 - {datetime.now()}")
 
                 while True:
                     msg = await ws.recv()
@@ -56,14 +61,18 @@ async def record_loop():
                     channel = data['arg']['channel']
                     res = data['data'][0]
 
+                    # 更新最新成交
                     if channel == 'trades':
                         last_trade_state['px'] = float(res['px'])
                         last_trade_state['sz'] = float(res['sz'])
                         last_trade_state['side'] = 1 if res['side'] == 'buy' else -1
 
+                    # 盘口更新 -> 触发写入
                     elif channel == 'books5':
                         ts_loc = time.time()
                         ts_exch = int(res['ts'])
+                        
+                        # 扁平化 5 档数据
                         asks = [float(x) for item in res['asks'] for x in item[:2]]
                         bids = [float(x) for item in res['bids'] for x in item[:2]]
                         
@@ -78,6 +87,7 @@ async def record_loop():
             print(f"⚠️ [Collector] 连接断开: {e}，3秒后重连...")
             await asyncio.sleep(3)
             
+            # 检查日期变更，切换文件
             new_date = datetime.now().strftime('%Y%m%d')
             if new_date != current_date:
                 f.close()
